@@ -1,0 +1,76 @@
+package ct
+
+import (
+	"context"
+	"time"
+
+	"bitbucket.org/xoduxcrt/ctlog-update-processor/config"
+	"bitbucket.org/xoduxcrt/ctlog-update-processor/logger"
+	"bitbucket.org/xoduxcrt/ctlog-update-processor/msg"
+)
+
+type getEntries struct {
+	ctLogID        int
+	start          int64
+	end            int64
+	chan_serialize chan struct{}
+}
+
+func GetEntriesLauncher(ctx context.Context) {
+	logger.Logger.Info("Started GetEntriesLauncher")
+
+	for {
+		select {
+		// Launch get-entries calls as required, then fire a timer when it's time to do it again.
+		case <-time.After(launchGetEntries()):
+		// Respond to graceful shutdown requests.
+		case <-ctx.Done():
+			msg.ShutdownWG.Done()
+			logger.Logger.Info("Stopped GetEntriesLauncher")
+			return
+		}
+	}
+}
+
+func launchGetEntries() time.Duration {
+	syncMutex.Lock()
+	for id, ctl := range ctlog {
+		if ctl.isActive {
+			for j := len(ctl.getEntries); j < ctl.RequestsConcurrent && (ctl.latestQueuedEntryID < (ctl.TreeSize - 1)); j++ {
+				// Prepare a new get-entries call.
+				ge := getEntries{
+					ctLogID:        id,
+					start:          ctl.latestQueuedEntryID + 1,
+					end:            ctl.latestQueuedEntryID + ctl.BatchSize, // ctl.BatchSize is hard-coded to 256 for Static logs.
+					chan_serialize: make(chan struct{}, 1),
+				}
+				if ge.end%ctl.BatchSize != ctl.BatchSize-1 {
+					ge.end -= (ge.end%ctl.BatchSize + 1)
+					if ge.end-ge.start <= 0 {
+						ge.end += ctl.BatchSize
+					}
+				}
+				if ge.end > ctl.TreeSize-1 {
+					ge.end = ctl.TreeSize - 1
+				}
+				ctl.getEntries[ge.start] = &ge
+				ctl.latestQueuedEntryID = ge.end
+
+				// Signal the first get-entries goroutine to proceed to entry writing.
+				if !ctl.anyQueuedYet {
+					ctl.anyQueuedYet = true // Each subsequent get-entries goroutine will need to wait to be signaled by the preceding one.
+					ge.chan_serialize <- struct{}{}
+				}
+				switch ctl.Type {
+				case "rfc6962":
+					go ge.callRFC6962GetEntries()
+				case "static":
+					go ge.callStaticGetEntries()
+				}
+			}
+		}
+	}
+	syncMutex.Unlock()
+
+	return config.Config.CTLogs.GetEntriesLauncherFrequency
+}
